@@ -21,6 +21,7 @@ from telegram.ext import (
 from app.config import Settings
 from app.constants import PLANS, RETENTION_LINES
 from app.database import Database
+from app.external_access import ExternalMySQLConfig, ExternalSubscriptionVerifier
 from app.llm_client import EternalAIClient
 
 
@@ -31,6 +32,25 @@ class SavitaTelegramBot:
         self.llm_client = llm_client
         self.application: Application = Application.builder().token(settings.bot_token).build()
         self._retention_task: Optional[asyncio.Task] = None
+        self.external_verifier: Optional[ExternalSubscriptionVerifier] = None
+        if settings.external_access_enabled:
+            self.external_verifier = ExternalSubscriptionVerifier(
+                ExternalMySQLConfig(
+                    enabled=True,
+                    payments_host=settings.payments_db_host,
+                    payments_port=settings.payments_db_port,
+                    payments_user=settings.payments_db_user,
+                    payments_pass=settings.payments_db_pass,
+                    payments_name=settings.payments_db_name,
+                    subs_host=settings.subs_db_host,
+                    subs_port=settings.subs_db_port,
+                    subs_user=settings.subs_db_user,
+                    subs_pass=settings.subs_db_pass,
+                    subs_name=settings.subs_db_name,
+                    payments_query=settings.payments_db_check_query,
+                    subs_query=settings.subs_db_check_query,
+                )
+            )
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -96,7 +116,21 @@ class SavitaTelegramBot:
         return telegram_id in self.settings.admin_user_ids
 
     def _payment_required(self) -> bool:
-        return self.settings.payment_wall_enabled
+        # Hard-enforce paid access in production.
+        return True
+
+    async def _has_external_active_access(self, update: Update) -> bool:
+        if not self.external_verifier or not update.effective_user:
+            return False
+
+        try:
+            return await asyncio.to_thread(
+                self.external_verifier.has_access,
+                int(update.effective_user.id),
+                update.effective_user.username.lower() if update.effective_user.username else None,
+            )
+        except Exception:
+            return False
 
     def _plans_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -137,7 +171,7 @@ class SavitaTelegramBot:
             await self._reply(update, "access denied")
             return
 
-        if (not self._payment_required()) or self.db.has_active_access(user_id):
+        if await self._has_external_active_access(update):
             await self._reply(
                 update,
                 "there you are. private chat is open.",
@@ -153,36 +187,21 @@ class SavitaTelegramBot:
 
     async def cmd_plans(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._ensure_user(update)
-        if not self._payment_required():
-            await self._reply(update, "payment wall is currently disabled for testing.")
-            return
         await self._reply(update, "choose your pass.", reply_markup=self._plans_keyboard())
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = await self._ensure_user(update)
-        if not self._payment_required():
-            await self._reply(update, "test mode active: payment wall disabled.")
+        await self._ensure_user(update)
+        if await self._has_external_active_access(update):
+            await self._reply(update, "active: payment verified in access system.")
             return
-        sub = self.db.get_active_subscription(user_id)
-        if not sub:
-            await self._reply(
-                update,
-                "your pass is inactive. renew to continue.",
-                reply_markup=self._plans_keyboard(),
-            )
-            return
-
-        end = datetime.fromisoformat(sub["end_at"]).astimezone(timezone.utc)
         await self._reply(
             update,
-            f"active: {sub['plan_key'].title()}\nexpires: {end.strftime('%d %b %Y %H:%M UTC')}",
+            "payment not confirmed yet for your account. complete payment and wait for confirmation.",
+            reply_markup=self._plans_keyboard(),
         )
 
     async def cmd_renew(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._ensure_user(update)
-        if not self._payment_required():
-            await self._reply(update, "test mode active: no renewal needed right now.")
-            return
         await self._reply(update, "renew now.", reply_markup=self._plans_keyboard())
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -298,9 +317,9 @@ class SavitaTelegramBot:
                     continue
             return
 
-        if self._payment_required() and not self.db.has_active_access(internal_user_id):
+        if self._payment_required() and not (await self._has_external_active_access(update)):
             await update.message.reply_text(
-                "your pass is inactive. unlock to continue.",
+                "payment not confirmed for this Telegram account yet. unlock to continue.",
                 reply_markup=self._plans_keyboard(),
             )
             return
@@ -378,7 +397,13 @@ class SavitaTelegramBot:
 
         await self._reply(update, f"approved @{row['username'] or row['telegram_id']} for {approved.plan_key}")
         with contextlib.suppress(Exception):
-            await self.notify_user_unlock(int(row["telegram_id"]))
+            await self.application.bot.send_message(
+                chat_id=int(row["telegram_id"]),
+                text=(
+                    "payment noted. access opens automatically only after external payment system "
+                    "confirms your Telegram account."
+                ),
+            )
 
     async def cmd_ban(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not self._is_admin(update.effective_user.id):
