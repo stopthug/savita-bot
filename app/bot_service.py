@@ -53,6 +53,22 @@ class SavitaTelegramBot:
             )
         self._register_handlers()
 
+    def _welcome_text(self) -> str:
+        return "there you are. private chat is open."
+
+    async def _maybe_send_welcome_once(
+        self, internal_user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        memory = self.db.get_memory(internal_user_id)
+        if memory.get("welcome_sent") == "1":
+            return
+        self.db.upsert_memory(internal_user_id, "welcome_sent", "1")
+        await self._reply(
+            update,
+            self._welcome_text(),
+            reply_markup=self._chat_menu_keyboard(),
+        )
+
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
         self.application.add_handler(CommandHandler("plans", self.cmd_plans))
@@ -171,41 +187,37 @@ class SavitaTelegramBot:
             await self._reply(update, "access denied")
             return
 
-        if await self._has_external_active_access(update):
-            await self._reply(
-                update,
-                "there you are. private chat is open.",
-                reply_markup=self._chat_menu_keyboard(),
-            )
+        if not await self._has_external_active_access(update):
             return
 
-        await self._reply(
-            update,
-            "Savita Bhabhi is waiting privately...\n\nunlock your private pass to begin.",
-            reply_markup=self._plans_keyboard(),
-        )
+        await self._maybe_send_welcome_once(user_id, update, context)
 
     async def cmd_plans(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._ensure_user(update)
+        user_id = await self._ensure_user(update)
+        if not await self._has_external_active_access(update):
+            return
+        await self._maybe_send_welcome_once(user_id, update, context)
         await self._reply(update, "choose your pass.", reply_markup=self._plans_keyboard())
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._ensure_user(update)
-        if await self._has_external_active_access(update):
-            await self._reply(update, "active: payment verified in access system.")
+        user_id = await self._ensure_user(update)
+        if not await self._has_external_active_access(update):
             return
-        await self._reply(
-            update,
-            "payment not confirmed yet for your account. complete payment and wait for confirmation.",
-            reply_markup=self._plans_keyboard(),
-        )
+        await self._maybe_send_welcome_once(user_id, update, context)
+        await self._reply(update, "active: payment verified in access system.")
 
     async def cmd_renew(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._ensure_user(update)
+        user_id = await self._ensure_user(update)
+        if not await self._has_external_active_access(update):
+            return
+        await self._maybe_send_welcome_once(user_id, update, context)
         await self._reply(update, "renew now.", reply_markup=self._plans_keyboard())
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._ensure_user(update)
+        user_id = await self._ensure_user(update)
+        if not await self._has_external_active_access(update):
+            return
+        await self._maybe_send_welcome_once(user_id, update, context)
         await self._reply(
             update,
             (
@@ -226,12 +238,11 @@ class SavitaTelegramBot:
         if self.db.is_banned(user_id):
             await query.edit_message_text("access denied")
             return
+        if not await self._has_external_active_access(update):
+            return
 
         data = query.data or ""
         if data.startswith("plan:"):
-            if not self._payment_required():
-                await query.edit_message_text("payment wall disabled in test mode.")
-                return
             plan_key = data.split(":", 1)[1]
             if plan_key not in PLANS:
                 await query.edit_message_text("invalid plan")
@@ -285,6 +296,9 @@ class SavitaTelegramBot:
         if self.db.is_banned(internal_user_id):
             await update.message.reply_text("access denied")
             return
+        if not await self._has_external_active_access(update):
+            return
+        await self._maybe_send_welcome_once(internal_user_id, update, context)
 
         text = (update.message.text or "").strip()
         if not text:
@@ -317,12 +331,7 @@ class SavitaTelegramBot:
                     continue
             return
 
-        if self._payment_required() and not (await self._has_external_active_access(update)):
-            await update.message.reply_text(
-                "payment not confirmed for this Telegram account yet. unlock to continue.",
-                reply_markup=self._plans_keyboard(),
-            )
-            return
+        # External payment gate already enforced above.
 
         self.db.add_message(internal_user_id, "user", text)
         self.db.update_behavior_memory(internal_user_id, text)
